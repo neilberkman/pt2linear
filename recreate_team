@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+
+# Load environment variables from .env file
+source .env
+
+# Function to check if required environment variables are set
+check_env_vars() {
+  if [ -z "$LINEAR_API_TOKEN" ]; then
+    echo "Error: LINEAR_API_TOKEN not set. Please source your .env file."
+    exit 1
+  fi
+  if [ -z "$LINEAR_TEAM_NAME" ]; then
+    echo "Error: LINEAR_TEAM_NAME not set. Please source your .env file."
+    exit 1
+  fi
+}
+
+# Function to find the team ID
+find_team_id() {
+  curl -s -X POST https://api.linear.app/graphql \
+  -H "Authorization: $LINEAR_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  --data "{\"query\":\"{ teams { nodes { id name } } }\"}" | jq -r ".data.teams.nodes[] | select(.name == \"$LINEAR_TEAM_NAME\") | .id"
+}
+
+# Function to delete the team
+delete_team() {
+  local team_id="$1"
+  echo "Deleting team $LINEAR_TEAM_NAME..."
+  DELETE_RESPONSE=$(curl -s -X POST https://api.linear.app/graphql \
+  -H "Authorization: $LINEAR_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  --data "{\"query\":\"mutation { teamDelete(id: \\\"$team_id\\\") { success } }\"}")
+  if [[ "$DELETE_RESPONSE" == *"\"success\":true"* ]]; then
+    echo "Successfully deleted team $LINEAR_TEAM_NAME."
+  else
+    echo "Error deleting team: $DELETE_RESPONSE"
+    exit 1
+  fi
+}
+
+# Function to create a new team
+create_team() {
+  echo "Creating new team $LINEAR_TEAM_NAME..."
+  CREATE_RESPONSE=$(curl -s -X POST https://api.linear.app/graphql \
+  -H "Authorization: $LINEAR_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  --data "{\"query\":\"mutation { teamCreate(input: { name: \\\"$LINEAR_TEAM_NAME\\\" }) { team { id name } } }\"}")
+  NEW_TEAM_ID=$(echo "$CREATE_RESPONSE" | jq -r '.data.teamCreate.team.id')
+  if [ -n "$NEW_TEAM_ID" ]; then
+    echo "Successfully created new team $LINEAR_TEAM_NAME with ID: $NEW_TEAM_ID"
+  else
+    echo "Error creating new team: $CREATE_RESPONSE"
+    exit 1
+  fi
+}
+
+# Main script execution
+check_env_vars
+
+# Parse command line options
+FORCE=false
+while getopts ":f" opt; do
+  case ${opt} in
+    f ) FORCE=true ;;
+    \? ) echo "Usage: $0 [-f]" >&2
+         exit 1 ;;
+  esac
+done
+
+TEAM_ID=$(find_team_id)
+
+if [ -n "$TEAM_ID" ]; then
+  echo "Found team $LINEAR_TEAM_NAME with ID: $TEAM_ID"
+  
+  if [ "$FORCE" = true ]; then
+    delete_team "$TEAM_ID"
+  else
+    read -p "Type 'delete team' to proceed with deletion: " user_input
+    if [ "$user_input" = "delete team" ]; then
+      delete_team "$TEAM_ID"
+    else
+      echo "Team deletion cancelled."
+      exit 0
+    fi
+  fi
+else
+  echo "Team $LINEAR_TEAM_NAME not found. Proceeding to create a new team."
+fi
+
+create_team
