@@ -10,9 +10,13 @@ Linear does offer an [official CLI importer tool](https://github.com/linear/line
 - Converts Pivotal Tracker stories to Linear issues
 - Preserves attachments, including inline display for images
 - Links issues to their corresponding projects (based on PT epic-story relationships)
-- Retains labels
+- Retains labels (decide what labels to keep by setting ALLOWED_LABEL_NAMES)
 - Maintains story/issue state mapping
 - Preserves comments and tasks
+- Converts Pivotal story type to a Linear label 
+  - you must create the labels in Linear and set their ids (search for `LABEL_UUID`)
+  - to get a label UUID, use `CMD+k` in Linear
+- Logs to both console and a file (set SIMPLE_LOGGING env var when debugging)
 
 ## Setup
 
@@ -30,6 +34,7 @@ Linear does offer an [official CLI importer tool](https://github.com/linear/line
 ```
 
 Options:
+- `--setup`: Set up the Linear workflow states (useful when debugging, `--migrate` includes it)
 - `--migrate`: Perform the migration
 - `--assign`: Assign unassigned issues (use after migration)
 - `--dry-run`: Perform a dry run without making changes
