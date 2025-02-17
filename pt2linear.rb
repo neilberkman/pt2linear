@@ -12,8 +12,49 @@ require 'time'
 require 'typhoeus'
 require 'tzinfo'
 
-$logger = Logger.new($stdout)
-$logger.level = Logger::INFO
+# Set SIMPLE_LOGGING when debugging
+if not ENV['SIMPLE_LOGGING']
+  require 'active_support/tagged_logging'
+  require 'fileutils'
+
+  # Ensure that the LINEAR_TEAM_NAME environment variable is set
+  team_name = "log_" + (ENV['LINEAR_TEAM_NAME'] || 'default_team')
+
+  # Find the next available log file with increment based on team name
+  def next_log_file(team_name)
+    i = 1
+    while File.exist?("#{team_name}#{i}.log")
+      i += 1
+    end
+    "#{team_name}#{i}.log"
+  end
+
+  # Generate the next available log filename based on team name
+  log_file = next_log_file(team_name)
+
+  # Open file in write mode to overwrite content
+  file = File.open(log_file, 'w')  # 'w' for overwrite
+  file.sync = true  # Ensure logs are written immediately
+
+  file_logger = Logger.new(file)
+  stdout_logger = Logger.new(STDOUT)
+
+
+  # Use TaggedLogging to combine loggers
+  $logger = ActiveSupport::TaggedLogging.new(file_logger)
+  $logger.extend(Module.new do
+    define_method(:add) do |severity, message = nil, progname = nil, &block|
+      file_logger.add(severity, message, progname, &block)
+      stdout_logger.add(severity, message, progname, &block)
+    end
+  end)
+
+  file_logger.level = Logger::INFO
+  stdout_logger.level = Logger::WARN
+else
+  $logger = Logger.new($stdout)
+  $logger.level = Logger::INFO
+end
 
 class PivotalTrackerClient
   BASE_URL = 'https://www.pivotaltracker.com/services/v5'
@@ -171,10 +212,10 @@ class PivotalTrackerClient
   end
 
   def log_response(response, context)
-    $logger.debug "#{context}: Status #{response.code}"
-    $logger.debug 'Response Headers:'
+    $logger.info "#{context}: Status #{response.code}"
+    $logger.info 'Response Headers:'
     response.headers.each do |name, value|
-      $logger.debug "  #{name}: #{value}"
+      $logger.info "  #{name}: #{value}"
     end
     $logger.debug "Response Body: #{response.body}"
   end
@@ -184,6 +225,13 @@ class LinearClient
   BASE_URL = 'https://api.linear.app/graphql'
   MAX_RETRIES = 3
   INITIAL_BACKOFF = 1
+
+  # Filter labels per project
+  if ENV['PIVOTAL_PROJECT_ID'] == "1234567"
+    ALLOWED_LABEL_NAMES = ["MY_LABEL"]
+  else
+    ALLOWED_LABEL_NAMES = []
+  end
 
   LINEAR_WORKFLOW = {
     'backlog' => [
@@ -222,6 +270,11 @@ class LinearClient
     @team_id = find_team_id(ENV['LINEAR_TEAM_NAME'])
 
     @already_migrated_epics = find_all_pt_epics_from_linear
+    @already_migrated_stories = find_all_pt_stories_from_linear
+  end
+
+  def already_migrated_stories
+    @already_migrated_stories
   end
 
   def find_team_id(team_name)
@@ -240,9 +293,9 @@ class LinearClient
     data = JSON.parse(response.body)
     team = data['data']['teams']['nodes'].find { |t| t['name'] == team_name }
     if team
-      puts "[DEBUG] Found team '#{team_name}' with ID: #{team['id']}"
+      $logger.info "Found team '#{team_name}' with ID: #{team['id']}"
     else
-      puts "[ERROR] Team '#{team_name}' not found!"
+      $logger.error  "Team '#{team_name}' not found!"
     end
     team['id']
   end
@@ -264,10 +317,10 @@ class LinearClient
     data = JSON.parse(response.body)
     state = data['data']['workflowStates']['nodes'].find { |s| s['name'] == 'Todo' }
     if state
-      puts "[DEBUG] Found workflow state 'Todo' with ID: #{state['id']}"
+      $logger.info "Found workflow state 'Todo' with ID: #{state['id']}"
       state['id']
     else
-      puts "[ERROR] Failed to find workflow state 'Todo'"
+      $logger.error "Failed to find workflow state 'Todo'"
       raise 'State not found'
     end
   end
@@ -293,7 +346,7 @@ class LinearClient
     if projects && !projects.empty?
       epic_to_project_map = projects.each_with_object({}) do |project, memo|
         # Regex to extract Pivotal Tracker epic ID from content, assuming format: https://www.pivotaltracker.com/epic/show/ID
-        match = project['content'].to_s.match(%r{https://www\.pivotaltracker\.com/epic/show/(\d+)})
+        match = project['content'].to_s.match(%r{Pivotal Epic: \[https://www\.pivotaltracker\.com/epic/show/(\d+)})
         if match
           epic_id = match[1].to_i
           memo[epic_id] = project['id'] # Map Epic ID to Project ID
@@ -301,23 +354,72 @@ class LinearClient
       end
 
       if epic_to_project_map.any?
-        puts "Found Pivotal Tracker epic IDs mapped to Linear project IDs: #{epic_to_project_map}"
+        $logger.info  "Found Pivotal Tracker epic IDs mapped to Linear project IDs: #{epic_to_project_map}"
         epic_to_project_map
       else
-        puts 'No Pivotal Tracker epics found in project contents'
+        $logger.info 'No Pivotal Tracker epics found in project contents'
         {}
       end
     else
-      puts 'No projects found in Linear'
+      $logger.info 'No projects found in Linear'
       {}
     end
+  end
+
+  def find_all_pt_stories_from_linear
+    query = <<-GRAPHQL
+        query Nodes($filter: IssueFilter, $after: String) {
+          issues(first: 250, filter: $filter, after: $after) {
+            nodes {
+              id
+              description
+              assignee {
+                name
+              }
+            }
+            pageInfo {
+              hasNextPage
+              endCursor
+            }
+          }
+        }
+    GRAPHQL
+
+    result = {}
+    after_cursor = nil
+
+    loop do
+      variables = {
+        filter: {team: {name: {eq: ENV['LINEAR_TEAM_NAME']}}},
+        after: after_cursor
+      }
+      response = post(query, variables) # Assuming 'post' method is defined to send the query to Linear's GraphQL API
+      data = JSON.parse(response.body)
+      issues = data.dig('data', 'issues', 'nodes')
+      page_info = data.dig('data', 'issues', 'pageInfo')
+
+      if issues && !issues.empty?
+        issues.each do | issue |
+          match = issue['description'].to_s.match(%r{Pivotal Story: \[https://www\.pivotaltracker\.com/story/show/(\d+)})
+          if match
+            assignee = issue['assignee'] and issue['assignee']['name']
+            story_id = match[1].to_i
+            result[story_id] = {id: issue["id"], assignee: !!assignee}
+          end
+        end
+      end
+
+      break unless page_info["hasNextPage"]
+      after_cursor = page_info["endCursor"]
+    end
+    result
   end
 
   def project_for_epic(epic_id)
     @already_migrated_epics[epic_id]
   end
 
-  def create_linear_project(name, content)
+  def create_linear_project(name, content, created_at)
     mutation = <<~GRAPHQL
       mutation CreateProject($input: ProjectCreateInput!) {
         projectCreate(input: $input) {
@@ -337,6 +439,7 @@ class LinearClient
       input: {
         name:,
         teamIds: [@team_id],
+        startDate: created_at,
         content:
       }
     }
@@ -347,8 +450,8 @@ class LinearClient
     if data['data'] && data['data']['projectCreate'] && data['data']['projectCreate']['project']
       data['data']['projectCreate']['project']
     else
-      puts 'Failed to create project. Full API response:'
-      puts JSON.pretty_generate(data)
+      $logger.error 'Failed to create project. Full API response:'
+      $logger.error JSON.pretty_generate(data)
       nil
     end
   end
@@ -417,7 +520,10 @@ class LinearClient
 
   def get_state_id(name)
     state = @workflow_states.find { |s| s['name'] == name }
-    state ? state['id'] : nil
+    if not state
+      raise "Could not find Linear workflow state: #{name}"
+    end
+    state['id']
   end
 
   def find_issue_by_pt_link(pt_link)
@@ -438,14 +544,41 @@ class LinearClient
     issues.first if issues.any?
   end
 
-  def create_issue(title, description, label_names)
-    label_ids = label_names.map { |name| fetch_or_create_label(name) }.compact
+  def create_issue(title, description, label_names, story_type, created_at, state_id)
+    if ALLOWED_LABEL_NAMES
+      label_ids = label_names.select { |name| ALLOWED_LABEL_NAMES.include?(name) }.map { |name| fetch_or_create_label(name) }.compact
+    else
+      label_ids = label_names.map { |name| fetch_or_create_label(name) }.compact
+    end
+
+    type_label = nil
+    if story_type == "bug"
+      type_label = "LABEL_UUID"
+    end
+    if story_type == "chore"
+      type_label = "LABEL_UUID"
+    end
+    if story_type == "feature"
+      type_label = "LABEL_UUID"
+    end
+    
+    if story_type == "release"
+      return nil
+    end
+
+    if not type_label
+      raise "Invalid story_type '#{story_type}'"
+    end
+
+    label_ids << type_label
 
     input = {
       title:,
       description:,
       teamId: @team_id,
-      labelIds: label_ids
+      labelIds: label_ids,
+      createdAt: created_at,
+      stateId: state_id
     }
 
     mutation = <<-GRAPHQL
@@ -490,11 +623,11 @@ class LinearClient
     data.dig('data', 'issueUpdate', 'success')
   end
 
-  def create_comment_with_attachments(issue_id, body, attachments)
-    puts "[DEBUG] Creating comment with #{attachments.size} attachments for issue #{issue_id}"
+  def create_comment_with_attachments(issue_id, body, attachments, created_at)
+    $logger.info "Creating comment with #{attachments.size} attachments for issue #{issue_id}"
 
     attachment_markdown = attachments.map do |attachment|
-      puts "[DEBUG] Processing attachment: #{attachment[:filename]} (type: #{attachment[:type]})"
+      $logger.info "Processing attachment: #{attachment[:filename]} (type: #{attachment[:type]})"
 
       if attachment[:type].start_with?('image/')
         "![#{attachment[:filename]}](#{attachment[:url]})"
@@ -504,8 +637,7 @@ class LinearClient
     end.join("\n\n")
 
     full_body = "#{body}\n\n#{attachment_markdown}"
-    puts '[DEBUG] Full comment body:'
-    puts full_body
+    $logger.debug "Full comment body:\n#{full_body}"
 
     mutation = <<-GRAPHQL
         mutation($input: CommentCreateInput!) {
@@ -522,7 +654,8 @@ class LinearClient
     variables = {
       input: {
         issueId: issue_id,
-        body: full_body
+        body: full_body,
+        createdAt: created_at
       }
     }
 
@@ -531,37 +664,36 @@ class LinearClient
     data = JSON.parse(response.body)
     comment = data.dig('data', 'commentCreate', 'comment')
     if comment
-      puts "[DEBUG] Successfully created comment: ID #{comment['id']}"
-      puts '[DEBUG] Comment body:'
-      puts comment['body']
+      $logger.info "Successfully created comment: ID #{comment['id']}"
+      $logger.debug "Comment body:\n#{comment['body']}"
       comment
     else
-      puts "[ERROR] Failed to create comment for issue #{issue_id}"
-      puts "[ERROR] Response data: #{data.inspect}"
+      $logger.error  "Failed to create comment for issue #{issue_id}"
+      $logger.error  "Response data: #{data.inspect}"
       nil
     end
   end
 
   def upload_file(file_path, filename)
-    puts "[DEBUG] Uploading file: #{filename} from path: #{file_path}"
-    puts "[DEBUG] File exists before read: #{File.exist?(file_path)}"
+    $logger.info "Uploading file: #{filename} from path: #{file_path}"
+    $logger.debug "File exists before read: #{File.exist?(file_path)}"
     file_content = File.binread(file_path)
     file_size = file_content.bytesize
-    puts "[DEBUG] File size after read: #{file_size} bytes"
+    $logger.debug "File size after read: #{file_size} bytes"
     content_type = detect_mime_type(file_path, filename)
-    puts "[DEBUG] Detected content type: #{content_type}"
+    $logger.debug "Detected content type: #{content_type}"
 
     upload_payload = file_upload(content_type, filename, file_size)
 
     unless upload_payload && upload_payload['success'] && upload_payload['uploadFile']
-      puts "[ERROR] Failed to request upload URL for #{filename}"
+      $logger.error  "Failed to request upload URL for #{filename}"
       return nil
     end
 
     upload_url = upload_payload['uploadFile']['uploadUrl']
     asset_url = upload_payload['uploadFile']['assetUrl']
-    puts "[DEBUG] Received upload URL: #{upload_url}"
-    puts "[DEBUG] Received asset URL: #{asset_url}"
+    $logger.debug "Received upload URL: #{upload_url}"
+    $logger.debug "Received asset URL: #{asset_url}"
 
     headers = {
       'Content-Type' => content_type,
@@ -569,22 +701,22 @@ class LinearClient
     }
     upload_payload['uploadFile']['headers'].each do |header|
       headers[header['key']] = header['value']
-      puts "[DEBUG] Adding header: #{header['key']} = #{header['value']}"
+      $logger.debug "Adding header: #{header['key']} = #{header['value']}"
     end
 
     response = Typhoeus.put(upload_url, headers:, body: file_content)
 
     if response.success?
-      puts "[DEBUG] Successfully uploaded file to Linear: #{filename}"
+      $logger.debug "Successfully uploaded file to Linear: #{filename}"
       { url: asset_url, type: content_type, filename: }
     else
-      puts "[ERROR] Failed to upload file to Linear: #{filename}. Status: #{response.code}"
-      puts "[ERROR] Response body: #{response.body}"
+      $logger.error  "Failed to upload file to Linear: #{filename}. Status: #{response.code}"
+      $logger.error  "Response body: #{response.body}"
       nil
     end
   rescue StandardError => e
-    puts "[ERROR] Exception uploading file: #{e.message}"
-    puts e.backtrace.join("\n")
+    $logger.error  "Exception uploading file: #{e.message}"
+    $logger.error e.backtrace.join("\n")
     nil
   end
 
@@ -610,7 +742,7 @@ class LinearClient
   end
 
   def create_attachment(issue_id, asset_url, filename, content_type, comment_id = nil)
-    puts "[DEBUG] Creating attachment: #{filename}"
+    $logger.debug "Creating attachment: #{filename}"
     input = {
       issueId: issue_id,
       url: asset_url,
@@ -640,20 +772,20 @@ class LinearClient
     if response.success?
       data = JSON.parse(response.body)
       if data.dig('data', 'attachmentCreate', 'success')
-        puts '[DEBUG] Successfully created attachment in Linear'
+        $logger.debug 'Successfully created attachment in Linear'
         data.dig('data', 'attachmentCreate', 'attachment')
       else
-        puts "[ERROR] Failed to create attachment in Linear. Response: #{data}"
+        $logger.error "Failed to create attachment in Linear. Response: #{data}"
         nil
       end
     else
-      puts "[ERROR] Failed to create attachment in Linear. Status: #{response.code}"
-      puts "[ERROR] Response body: #{response.body}"
+      $logger.error "Failed to create attachment in Linear. Status: #{response.code}"
+      $logger.error "Response body: #{response.body}"
       nil
     end
   rescue StandardError => e
-    puts "[ERROR] Exception creating attachment: #{e.message}"
-    puts e.backtrace.join("\n")
+    $logger.error "Exception creating attachment: #{e.message}"
+    $logger.error e.backtrace.join("\n")
     nil
   end
 
@@ -696,41 +828,37 @@ class LinearClient
     labels = data.dig('data', 'issueLabels', 'nodes')
 
     if labels
-      puts "[DEBUG] Fetched #{labels.size} labels from Linear"
+      $logger.debug "Fetched #{labels.size} labels from Linear"
       labels
     else
-      puts '[ERROR] Failed to fetch labels from Linear'
+      $logger.error 'Failed to fetch labels from Linear'
       []
     end
   end
 
   def fetch_team_members
     query = <<-GRAPHQL
-        query($teamId: String!) {
-          team(id: $teamId) {
-            members {
-              nodes {
-                id
-                name
-                email
-              }
+        query {
+          users(first: 250) {
+            nodes {
+              id
+              name
+              email
             }
           }
         }
     GRAPHQL
 
-    variables = { teamId: @team_id }
-    response = post(query, variables)
+    response = post(query)
     log_response(response, 'Fetch Team Members')
-
     data = JSON.parse(response.body)
-    members = data.dig('data', 'team', 'members', 'nodes')
+    members = data.dig('data', 'users', 'nodes')
 
     if members
-      puts "[DEBUG] Fetched #{members.size} team members from Linear"
+      $logger.debug "Fetched #{members.size} team members from Linear"
       members
     else
-      puts '[ERROR] Failed to fetch team members from Linear'
+      $logger.error 'Failed to fetch team members from Linear'
       []
     end
   end
@@ -831,11 +959,11 @@ class LinearClient
       if response.success?
         return response
       elsif response.code == 429 || (response.code >= 400 && response.code < 500 && response.body.include?('RATELIMITED'))
-        puts '[WARN] Rate limit exceeded. Waiting for reset.'
+        $logger.warn 'Rate limit exceeded. Waiting for reset.'
         next
       else
-        puts "[ERROR] API request failed: #{response.code}"
-        puts "[ERROR] Response Body: #{response.body}"
+        $logger.error  "API request failed: #{response.code}"
+        $logger.error  "Response Body: #{response.body}"
         raise "API request failed: #{response.code}, Body: #{response.body}"
       end
     end
@@ -889,7 +1017,7 @@ class LinearClient
     return unless @reset_time && @reset_time > now
 
     sleep_duration = (@reset_time - now).ceil / SLEEP_FRACTION
-    puts "[INFO] Rate limit reached. Sleeping for #{sleep_duration} seconds. Full reset at #{@reset_time}"
+    $logger.info "Rate limit reached. Sleeping for #{sleep_duration} seconds. Full reset at #{@reset_time}"
     sleep(sleep_duration)
   end
 
@@ -907,18 +1035,21 @@ class LinearClient
   end
 
   def log_response(response, context)
-    puts "[DEBUG] #{context}: Status #{response.code}"
-    puts '[DEBUG] Response Headers:'
+    $logger.info "#{context}: Status #{response.code}"
+    $logger.info 'Response Headers:'
     response.headers.each do |name, value|
-      puts "  #{name}: #{value}"
+      $logger.info "  #{name}: #{value}"
+      if name == "x-ratelimit-requests-remaining"
+        puts "Remaining r/h: #{value}"
+      end
     end
-    puts '[DEBUG] Response Body:'
-    puts response.body
+    $logger.debug 'Response Body:'
+    $logger.debug response.body
   end
 
   def detect_mime_type(file_path, filename = nil)
-    puts "[DEBUG] Entering detect_mime_type for file: #{file_path}"
-    puts "[DEBUG] File exists: #{File.exist?(file_path)}"
+    $logger.debug "Entering detect_mime_type for file: #{file_path}"
+    $logger.debug "File exists: #{File.exist?(file_path)}"
 
     begin
       # Attempt to detect MIME type by reading the file content.
@@ -927,26 +1058,26 @@ class LinearClient
 
       # If successful, return the detected type.
       if mime
-        puts "[DEBUG] Detected content type by magic: #{mime.type}"
+        $logger.debug "Detected content type by magic: #{mime.type}"
         return mime.type
       end
     rescue StandardError => e
       # Handle binread errors gracefully.
-      puts "[ERROR] Failed to read file content: #{e.message}"
-      puts "[ERROR] Backtrace: #{e.backtrace.join("\n")}"
+      $logger.error  "Failed to read file content: #{e.message}"
+      $logger.error  "Backtrace: #{e.backtrace.join("\n")}"
     end
 
     # Fall back to filename-based MIME detection if reading content fails or yields no result.
     if filename
       mime = MimeMagic.by_path(filename)
       if mime
-        puts "[DEBUG] Fallback MIME type by filename: #{mime.type}"
+        $logger.debug "Fallback MIME type by filename: #{mime.type}"
         return mime.type
       end
     end
 
     # Default to 'application/octet-stream' if all detection attempts fail.
-    puts '[WARN] Using default MIME type: application/octet-stream'
+    $logger.warn 'Using default MIME type: application/octet-stream'
     'application/octet-stream'
   end
 
@@ -979,8 +1110,8 @@ class LinearClient
       data = JSON.parse(response.body)
       data['data']['fileUpload']
     else
-      puts "[ERROR] Failed to get upload URL from Linear. Status: #{response.code}"
-      puts "[ERROR] Response body: #{response.body}"
+      $logger.error "Failed to get upload URL from Linear. Status: #{response.code}"
+      $logger.error "Response body: #{response.body}"
       nil
     end
   end
@@ -1022,6 +1153,7 @@ class MigrationManager
   }.freeze
 
   PT_TO_LINEAR_STATE = {
+    'planned' => 'Backlog',
     'unscheduled' => 'Icebox',
     'unstarted' => 'Backlog',
     'started' => 'In Progress',
@@ -1130,7 +1262,7 @@ class MigrationManager
       content += "\n\n---\nComments:\n"
       comments.each do |comment|
         author = get_pt_comment_author(comment['person_id'])
-        content += "\n#{author}:\n#{comment['text']}\n"
+        content += "\n#{author} (#{comment['created_at']}):\n#{comment['text']}\n"
 
         next unless comment['file_attachments']
 
@@ -1151,7 +1283,7 @@ class MigrationManager
         $logger.info "[DRY RUN] Would create project: '#{epic['name']}'"
       else
         $logger.info "Creating Linear project for PT epic: #{epic['name']} (ID: #{epic['id']})"
-        linear_project = @linear_client.create_linear_project(epic['name'], content)
+        linear_project = @linear_client.create_linear_project(epic['name'], content, epic_details['created_at'])
         if linear_project
           @epic_mapping[epic['id']] = linear_project['id']
           $logger.info "Created project in Linear: #{epic['name']} (ID: #{linear_project['id']})"
@@ -1176,25 +1308,51 @@ class MigrationManager
     sorted_stories.each do |story|
       bar.increment!
       pt_link = "https://www.pivotaltracker.com/story/show/#{story['id']}"
+      
+#       if story['current_state'] != 'unscheduled'
+#         $logger.info "Skip unscheduled story: #{story['id']} #{story['name']}"
+#         next
+#       end
 
-      existing_issue = @linear_client.find_issue_by_pt_link(pt_link)
+      existing_issue = @linear_client.already_migrated_stories[story['id']]
       if existing_issue
-        $logger.info "Story already migrated: #{existing_issue['title']}"
-        previous_issue_id = existing_issue['id']
+        $logger.info "Story already migrated: #{story['id']}"
+        previous_issue_id = existing_issue[:id]
         next
       end
 
       story_details = @pt_client.fetch_story_details(story['id'])
 
-      last_assigned = if story_details['owner_ids'] && !story_details['owner_ids'].empty?
-                        owner_id = story_details['owner_ids'].last
-                        owner = @pt_team_members[owner_id]
-                        owner ? "#{owner['name']} <#{owner['email']}>" : 'Unassigned'
-                      else
-                        'Unassigned'
-                      end
+      label_names = story_details['labels'].map { |label| label['name'] }
+      label_names << 'migrated'
+      label_names.uniq!
 
-      description = "#{story_details['description']}\n\n---\nPivotal Story: #{pt_link}\nLast assigned to: #{last_assigned}"
+      # if not label_names.include?('e2e')
+      #   $logger.info "Skip non e2e story: #{story['id']}"
+      #   next
+      # end
+
+      requester = @pt_team_members[story_details['requested_by_id']]
+      requester = requester ? "#{requester['name']} <#{requester['email']}>" : "<#{story_details['requested_by_id']}>"
+
+      if story_details['owner_ids'] && !story_details['owner_ids'].empty?
+        owner_list  = []
+        first_assigned = nil
+
+        story_details['owner_ids'].each do | owner_id |
+          owner = @pt_team_members[owner_id]
+          owner_list << (owner ? "\n- #{owner['name']} <#{owner['email']}>" : "\n- <#{owner_id}>")
+          first_assigned = first_assigned ? first_assigned : (owner ? "#{owner['name']} <#{owner['email']}>" : nil)
+        end
+
+        assigned = owner_list.join()
+        first_assigned = first_assigned ? first_assigned : 'Unassigned'
+      else
+        assigned = 'Unassigned'
+        first_assigned = 'Unassigned'
+      end
+
+      description = "#{story_details['description']}\n\n---\nPivotal Story: #{pt_link}\nRequested by: #{requester}\nAssigned to:#{assigned}"
 
       unless story_details['pull_requests'].empty?
         description += "\n\nPull Requests:\n" + story_details['pull_requests'].map do |pr|
@@ -1210,10 +1368,6 @@ class MigrationManager
         end.join("\n")
       end
 
-      label_names = story_details['labels'].map { |label| label['name'] }
-      label_names << 'migrated_story'
-      label_names.uniq!
-
       if @dry_run
         $logger.info "[DRY RUN] Would create story: '#{story['name']}' with labels: #{label_names.join(', ')}"
       else
@@ -1222,7 +1376,9 @@ class MigrationManager
           description,
           label_names,
           story['current_state'],
-          previous_issue_id
+          previous_issue_id,
+          story['story_type'],
+          story['created_at'],
         )
 
         if linear_issue
@@ -1231,9 +1387,7 @@ class MigrationManager
           migrate_story_comments_and_attachments(story['id'], linear_issue['id'])
           migrate_story_tasks(story['id'], linear_issue['id'])
 
-          assign_issue(linear_issue['id'], last_assigned) unless last_assigned == 'Unassigned'
-        else
-          $logger.error "Failed to create story in Linear: #{story['name']}"
+          assign_issue(linear_issue['id'], first_assigned) unless first_assigned == 'Unassigned'
         end
       end
     end
@@ -1252,29 +1406,35 @@ class MigrationManager
     person_id = comment['person_id']
     person_info = @pt_team_members[person_id]
 
-    if person_info
-      author_name = person_info['name']
-      author_email = person_info['email']
+    # Linking commits just adds noise. Linking PRs should suffice.
+    if comment['text'] and comment['text'].start_with?('Commit by')
+      $logger.info "Skipping commit"
+      return nil
+    end
 
-      body = "Comment by #{author_name} <#{author_email}>:\n\n#{comment['text']}"
+    if not person_info
+      $logger.warn "Could not find person information for comment by person_id: #{person_id}"
+    end
 
-      attachments = process_attachments(comment)
+    author_name = person_info ? person_info['name'] : ""
+    author_email = person_info ? person_info['email'] : person_id
 
-      if @dry_run
-        $logger.info "[DRY RUN] Would create comment: '#{body[0..50]}...'"
-        if attachments.any?
-          $logger.info "[DRY RUN] Would create attachments: #{attachments.map { |a| a[:filename] }.join(', ')}"
-        end
-      else
-        linear_comment = @linear_client.create_comment_with_attachments(linear_issue_id, body, attachments)
-        if linear_comment
-          $logger.info "Created comment with #{attachments.size} attachments for issue #{linear_issue_id}"
-        else
-          $logger.error "Failed to create comment for issue #{linear_issue_id}"
-        end
+    body = "Comment by #{author_name} <#{author_email}>:\n\n#{comment['text']}"
+
+    attachments = process_attachments(comment)
+
+    if @dry_run
+      $logger.info "[DRY RUN] Would create comment: '#{body[0..50]}...'"
+      if attachments.any?
+        $logger.info "[DRY RUN] Would create attachments: #{attachments.map { |a| a[:filename] }.join(', ')}"
       end
     else
-      $logger.warn "Could not find person information for comment by person_id: #{person_id}"
+      linear_comment = @linear_client.create_comment_with_attachments(linear_issue_id, body, attachments, comment["created_at"])
+      if linear_comment
+        $logger.info "Created comment with #{attachments.size} attachments for issue #{linear_issue_id}"
+      else
+        $logger.error "Failed to create comment for issue #{linear_issue_id}"
+      end
     end
   rescue StandardError => e
     $logger.error "Failed to process comment: #{e.message}"
@@ -1283,7 +1443,7 @@ class MigrationManager
   end
 
   def process_attachments(comment)
-    puts "*** COMMENT: #{comment.inspect}"
+    $logger.debug "*** COMMENT: #{comment.inspect}"
     return [] unless comment['file_attachments']
 
     comment['file_attachments'].map do |attachment|
@@ -1313,44 +1473,53 @@ class MigrationManager
     stories.each do |story|
       next if story['owner_ids'].nil? || story['owner_ids'].empty?
 
-      pt_link = "https://www.pivotaltracker.com/story/show/#{story['id']}"
-      linear_issue = @linear_client.find_issue_by_pt_link(pt_link)
+      linear_issue = @linear_client.already_migrated_stories[story['id']]
+      
+      if not linear_issue
+        $logger.info "Could not find Linear issue for PT story: #{story['id']}"
+        next
+      end
+      
+      next if linear_issue[:assignee]
+      
+      first_assigned = nil
 
-      if linear_issue
-        owner_id = story['owner_ids'].last
+      story['owner_ids'].each do | owner_id |
         owner = @pt_team_members[owner_id]
         if owner
-          last_assigned = "#{owner['name']} <#{owner['email']}>"
-          assign_issue(linear_issue['id'], last_assigned)
-        else
-          $logger.warn "Could not find owner information for PT story: #{story['id']}"
+          first_assigned = "#{owner['name']} <#{owner['email']}>"
+          break
         end
+      end
+
+      if first_assigned
+        assign_issue(linear_issue[:id], first_assigned)
       else
-        $logger.warn "Could not find Linear issue for PT story: #{story['id']}"
+        $logger.info "Could not find owner information for PT story: #{story['id']}"
       end
     end
   end
 
-  def assign_issue(linear_issue_id, last_assigned)
+  def assign_issue(linear_issue_id, first_assigned)
     return if @dry_run
-    return if last_assigned == 'Unassigned'
+    return if first_assigned == 'Unassigned'
 
-    user = find_matching_user(last_assigned)
+    user = find_matching_user(first_assigned)
     if user
       result = @linear_client.assign_issue(linear_issue_id.to_s, user['id'].to_s)
       if result
-        $logger.info "Assigned issue #{linear_issue_id} to #{user['name']}"
+        $logger.warn "Assigned issue #{linear_issue_id} to #{user['name']}"
       else
         $logger.error "Failed to assign issue #{linear_issue_id} to #{user['name']}"
       end
     else
-      $logger.warn "Could not find matching user for #{last_assigned}"
+      $logger.warn "Could not find matching user for #{first_assigned}"
     end
   end
 
-  def find_matching_user(last_assigned)
-    email = last_assigned.match(/<(.+)>/)&.[](1)
-    name = last_assigned.split(' <').first
+  def find_matching_user(first_assigned)
+    email = first_assigned.match(/<(.+)>/)&.[](1)
+    name = first_assigned.split(' <').first
 
     @linear_team_members.find { |member| member['email'] == email } ||
       @linear_team_members.find { |member| member['name'] == name }
@@ -1407,7 +1576,7 @@ class MigrationManager
         end
       else
         $logger.debug 'Creating comment with attachments in Linear'
-        linear_comment = @linear_client.create_comment_with_attachments(linear_id, body, attachments)
+        linear_comment = @linear_client.create_comment_with_attachments(linear_id, body, attachments, comment['created_at'])
         if linear_comment
           $logger.debug "Successfully created comment with attachments: ID #{linear_comment['id']}"
           $logger.debug 'Comment body:'
@@ -1518,7 +1687,7 @@ class MigrationManager
     end
   end
 
-  def create_linear_issue(title, description, label_names, pt_state, previous_issue_id)
+  def create_linear_issue(title, description, label_names, pt_state, previous_issue_id, story_type, created_at)
     linear_state = PT_TO_LINEAR_STATE[pt_state]
     state_id = @linear_client.get_state_id(linear_state)
 
@@ -1526,11 +1695,9 @@ class MigrationManager
       $logger.info "[DRY RUN] Would create issue: '#{title}' with state: #{linear_state}"
       nil
     else
-      issue = @linear_client.create_issue(title, description, label_names)
+      issue = @linear_client.create_issue(title, description, label_names, story_type, created_at, state_id)
 
       if issue
-        @linear_client.update_issue(issue['id'], { stateId: state_id }) if state_id
-
         if previous_issue_id
           previous_issue = @linear_client.get_issue(previous_issue_id)
           if previous_issue
@@ -1575,6 +1742,10 @@ if __FILE__ == $PROGRAM_NAME
       options[:assign] = true
     end
 
+    opts.on('--setup', 'Assign unassigned issues') do
+      options[:setup] = true
+    end
+
     opts.on('--dry-run', 'Perform a dry run') do
       options[:dry_run] = true
     end
@@ -1584,15 +1755,18 @@ if __FILE__ == $PROGRAM_NAME
     end
   end.parse!
 
-  if options[:migrate] || options[:assign]
+  if options[:migrate] || options[:assign] || options[:setup]
     manager = MigrationManager.new(dry_run: options[:dry_run])
 
     if options[:migrate]
       manager.migrate
     elsif options[:assign]
       manager.assign
+    elsif options[:setup]
+      # MigrationManager.new sets the workflow states
+      puts 'Set up linear workflow states.'
     end
   else
-    puts 'No action specified. Use --migrate or --assign.'
+    puts 'No action specified. Use --migrate, --assign or --setup.'
   end
 end
